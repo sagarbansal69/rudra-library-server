@@ -1,4 +1,3 @@
-
 const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
@@ -9,6 +8,9 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+// Serve the app â€” MUST be before API routes
+app.use(express.static(path.join(__dirname, 'public')));
 
 const DB_FILE = path.join(__dirname, 'data.json');
 
@@ -40,11 +42,12 @@ function dueMsg(name,seat,fee,month){
   return `Hello ${name},\n\nYour library fee of Rs.${fee} for ${month} is PENDING.\n\nSeat: ${seat}\nAmount: Rs.${fee}\n\nPay by 5th to keep your seat.\n\nRudra Library & Study Point\nOpen 06:00 AM - 11:00 PM`;
 }
 
-app.get('/', (req,res) => {
+// API status
+app.get('/api', (req,res) => {
   const db=loadDB();
   const occ=Object.values(db.seats).filter(s=>s.status==='occupied').length;
   const due=Object.keys(db.seats).filter(k=>db.seats[k].status==='occupied'&&isDue(db.seats[k].student)).length;
-  res.json({status:'running',library:'Rudra Library & Study Point',whatsapp:'CallMeBot ready',occupancy:`${occ}/38`,dueThisMonth:due});
+  res.json({status:'running',library:'Rudra Library & Study Point',occupancy:`${occ}/38`,dueThisMonth:due});
 });
 
 app.post('/hikvision-alert', async(req,res)=>{
@@ -98,9 +101,10 @@ app.get('/due-list',(req,res)=>{
   res.json({month:curMonth(),total:due.length,due});
 });
 
+// Catch-all â€” serve app for any unknown route
+app.get('*', (req,res)=>{
+  res.sendFile(path.join(__dirname,'public','index.html'));
+});
+
 const PORT=process.env.PORT||3000;
 app.listen(PORT,()=>console.log(`Rudra Library Server on port ${PORT}`));
-
-// Serve the app
-const publicPath = require('path').join(__dirname, 'public');
-require('fs').existsSync(publicPath) && app.use(require('express').static(publicPath));
