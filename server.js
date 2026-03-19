@@ -99,3 +99,7 @@ app.get('/due-list',(req,res)=>{
 
 const PORT=process.env.PORT||3000;
 app.listen(PORT,()=>console.log(`Rudra Library Server on port ${PORT}`));
+
+// Serve the app
+const publicPath = require('path').join(__dirname, 'public');
+require('fs').existsSync(publicPath) && app.use(require('express').static(publicPath));
