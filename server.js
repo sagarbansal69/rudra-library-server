@@ -10,7 +10,7 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 // Serve the app â€” MUST be before API routes
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.static(path.join(__dirname)));
 
 const DB_FILE = path.join(__dirname, 'data.json');
 
@@ -103,7 +103,7 @@ app.get('/due-list',(req,res)=>{
 
 // Catch-all â€” serve app for any unknown route
 app.get('*', (req,res)=>{
-  res.sendFile(path.join(__dirname,'public','index.html'));
+  res.sendFile(path.join(__dirname,'index.html'));
 });
 
 const PORT=process.env.PORT||3000;
