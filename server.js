@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
+const axios = require('axios');
 
 const app = express();
 app.use(cors());
@@ -10,182 +11,91 @@ app.use(express.urlencoded({ extended: true }));
 
 const DB_FILE = path.join(__dirname, 'data.json');
 
-// ── helpers ──────────────────────────────────────────────────────────────────
-
 function loadDB() {
   if (!fs.existsSync(DB_FILE)) {
-    const fresh = { seats: {}, transactions: [], motionLog: [], settings: { boysFee: 900, girlsFee: 800 } };
-    for (let i = 1; i <= 38; i++) fresh.seats[String(i)] = { status: 'vacant', student: null };
-    saveDB(fresh);
-    return fresh;
+    const fresh = { seats:{}, transactions:[], motionLog:[], settings:{ boysFee:900, girlsFee:800, callmebotKeys:{} } };
+    for (let i=1;i<=38;i++) fresh.seats[String(i)]={status:'vacant',student:null};
+    saveDB(fresh); return fresh;
   }
-  return JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
+  return JSON.parse(fs.readFileSync(DB_FILE,'utf8'));
 }
+function saveDB(data){ fs.writeFileSync(DB_FILE, JSON.stringify(data,null,2)); }
+function curMonth(){ return new Date().toISOString().slice(0,7); }
+function isDue(student){ return student ? !student.paidMonths.includes(curMonth()) : false; }
+function getFee(gender,db){ return gender==='female'?db.settings.girlsFee:db.settings.boysFee; }
 
-function saveDB(data) {
-  fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
-}
-
-function curMonth() {
-  return new Date().toISOString().slice(0, 7);
-}
-
-function isDue(student) {
-  if (!student) return false;
-  return !student.paidMonths.includes(curMonth());
-}
-
-// ── Hikvision webhook ─────────────────────────────────────────────────────────
-// Hikvision sends XML or form-data on motion. We parse it and log entry.
-
-app.post('/hikvision-alert', async (req, res) => {
-  console.log('[Hikvision] Alert received:', JSON.stringify(req.body).slice(0, 200));
-
-  const db = loadDB();
-  const entry = {
-    id: Date.now(),
-    timestamp: new Date().toISOString(),
-    type: req.body.eventType || req.body.EventType || 'motion',
-    channel: req.body.channelID || req.body.ChannelID || '1',
-    raw: req.body
-  };
-  db.motionLog.unshift(entry);
-  if (db.motionLog.length > 500) db.motionLog = db.motionLog.slice(0, 500);
-  saveDB(db);
-
-  // Check all occupied seats with due fees and send WhatsApp
-  const dueStudents = Object.values(db.seats)
-    .filter(s => s.status === 'occupied' && isDue(s.student));
-
-  for (const seat of dueStudents) {
-    const s = seat.student;
-    const fee = s.gender === 'female' ? db.settings.girlsFee : db.settings.boysFee;
-    await sendWhatsApp(s.phone, s.name, fee, curMonth());
-  }
-
-  res.status(200).send('OK');
-});
-
-// ── WhatsApp via whatsapp-web.js ──────────────────────────────────────────────
-
-let waClient = null;
-let waStatus = 'not_initialized';
-let waQR = null;
-
-async function initWhatsApp() {
+async function sendWhatsApp(phone, name, message, db) {
+  const clean = phone.replace(/\D/g,'');
+  const apikey = db.settings.callmebotKeys?.[clean];
+  if (!apikey){ console.log(`[WA] No key for ${name}`); return {sent:false,reason:'no_key'}; }
   try {
-    const { Client, LocalAuth } = require('whatsapp-web.js');
-    waClient = new Client({ authStrategy: new LocalAuth(), puppeteer: { args: ['--no-sandbox'] } });
-
-    waClient.on('qr', (qr) => {
-      waQR = qr;
-      waStatus = 'waiting_qr';
-      console.log('[WhatsApp] Scan QR at GET /wa-qr');
-    });
-
-    waClient.on('ready', () => {
-      waStatus = 'ready';
-      waQR = null;
-      console.log('[WhatsApp] Ready');
-    });
-
-    waClient.on('disconnected', () => { waStatus = 'disconnected'; });
-    await waClient.initialize();
-  } catch (e) {
-    console.log('[WhatsApp] Not available:', e.message);
-    waStatus = 'unavailable';
-  }
+    const url = `https://api.callmebot.com/whatsapp.php?phone=91${clean}&text=${encodeURIComponent(message)}&apikey=${apikey}`;
+    await axios.get(url,{timeout:10000});
+    console.log(`[WA] Sent to ${name}`); return {sent:true};
+  } catch(e){ console.log(`[WA] Failed:`,e.message); return {sent:false,reason:e.message}; }
 }
 
-async function sendWhatsApp(phone, name, fee, month) {
-  if (!waClient || waStatus !== 'ready') {
-    console.log(`[WhatsApp] Would send to ${phone}: Fee due ₹${fee}`);
-    return;
-  }
-  try {
-    const number = phone.replace(/\D/g, '');
-    const chatId = `91${number}@c.us`;
-    const msg = `Hello ${name},\n\nYour library seat fee of ₹${fee} for ${month} is pending.\n\nPlease pay at the earliest to keep your seat.\n\nThank you.`;
-    await waClient.sendMessage(chatId, msg);
-    console.log(`[WhatsApp] Sent to ${name} (${phone})`);
-  } catch (e) {
-    console.log('[WhatsApp] Send error:', e.message);
-  }
+function dueMsg(name,seat,fee,month){
+  return `Hello ${name},\n\nYour library fee of Rs.${fee} for ${month} is PENDING.\n\nSeat: ${seat}\nAmount: Rs.${fee}\n\nPay by 5th to keep your seat.\n\nRudra Library & Study Point\nOpen 06:00 AM - 11:00 PM`;
 }
 
-// ── WhatsApp QR endpoint ──────────────────────────────────────────────────────
-
-app.get('/wa-qr', (req, res) => {
-  if (waStatus === 'ready') return res.send('<h2>WhatsApp is connected and ready.</h2>');
-  if (!waQR) return res.send(`<h3>Status: ${waStatus}</h3><p>QR not ready yet. Refresh in 10 seconds.</p>`);
-  res.send(`
-    <html><body style="text-align:center;font-family:sans-serif;padding:2rem">
-    <h2>Scan this QR with WhatsApp</h2>
-    <p>Open WhatsApp → Linked Devices → Link a Device</p>
-    <img src="https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(waQR)}" />
-    <p style="color:gray;font-size:13px">Refresh page after scanning</p>
-    </body></html>
-  `);
+app.get('/', (req,res) => {
+  const db=loadDB();
+  const occ=Object.values(db.seats).filter(s=>s.status==='occupied').length;
+  const due=Object.keys(db.seats).filter(k=>db.seats[k].status==='occupied'&&isDue(db.seats[k].student)).length;
+  res.json({status:'running',library:'Rudra Library & Study Point',whatsapp:'CallMeBot ready',occupancy:`${occ}/38`,dueThisMonth:due});
 });
 
-// ── API: send manual WhatsApp to all due students ─────────────────────────────
-
-app.post('/send-due-reminders', async (req, res) => {
-  const db = loadDB();
-  const due = Object.entries(db.seats)
-    .filter(([, s]) => s.status === 'occupied' && isDue(s.student));
-
-  let sent = 0;
-  for (const [, seat] of due) {
-    const s = seat.student;
-    const fee = s.gender === 'female' ? db.settings.girlsFee : db.settings.boysFee;
-    await sendWhatsApp(s.phone, s.name, fee, curMonth());
-    sent++;
+app.post('/hikvision-alert', async(req,res)=>{
+  const db=loadDB();
+  db.motionLog.unshift({id:Date.now(),timestamp:new Date().toISOString(),type:req.body.eventType||'motion'});
+  if(db.motionLog.length>500) db.motionLog=db.motionLog.slice(0,500);
+  const dueSeats=Object.keys(db.seats).filter(k=>db.seats[k].status==='occupied'&&isDue(db.seats[k].student));
+  let sent=0;
+  for(const k of dueSeats){
+    const s=db.seats[k].student; const fee=getFee(s.gender,db);
+    const r=await sendWhatsApp(s.phone,s.name,dueMsg(s.name,k,fee,curMonth()),db);
+    if(r.sent) sent++;
   }
-  res.json({ success: true, sent, total: due.length });
+  saveDB(db); res.json({success:true,motionLogged:true,whatsappSent:sent});
 });
 
-// ── API: sync library state from browser app ──────────────────────────────────
-
-app.post('/sync', (req, res) => {
-  const { state } = req.body;
-  if (!state) return res.status(400).json({ error: 'No state provided' });
-  saveDB(state);
-  res.json({ success: true });
+app.post('/send-due-reminders', async(req,res)=>{
+  const db=loadDB();
+  const dueSeats=Object.keys(db.seats).filter(k=>db.seats[k].status==='occupied'&&isDue(db.seats[k].student));
+  const results=[];
+  for(const k of dueSeats){
+    const s=db.seats[k].student; const fee=getFee(s.gender,db);
+    const r=await sendWhatsApp(s.phone,s.name,dueMsg(s.name,k,fee,curMonth()),db);
+    results.push({seat:k,name:s.name,...r});
+  }
+  res.json({success:true,total:dueSeats.length,results});
 });
 
-app.get('/state', (req, res) => {
-  res.json(loadDB());
+app.post('/register-wa-key',(req,res)=>{
+  const {phone,apikey}=req.body;
+  if(!phone||!apikey) return res.status(400).json({error:'phone and apikey required'});
+  const db=loadDB(); const clean=phone.replace(/\D/g,'');
+  if(!db.settings.callmebotKeys) db.settings.callmebotKeys={};
+  db.settings.callmebotKeys[clean]=apikey; saveDB(db);
+  res.json({success:true,message:`Key registered for ${clean}`});
 });
 
-// ── Motion log ────────────────────────────────────────────────────────────────
-
-app.get('/motion-log', (req, res) => {
-  const db = loadDB();
-  res.json(db.motionLog || []);
+app.post('/sync',(req,res)=>{
+  const {state}=req.body; if(!state) return res.status(400).json({error:'No state'});
+  saveDB(state); res.json({success:true});
 });
 
-// ── Health check ──────────────────────────────────────────────────────────────
-
-app.get('/', (req, res) => {
-  res.json({
-    status: 'running',
-    whatsapp: waStatus,
-    endpoints: [
-      'POST /hikvision-alert  — Hikvision webhook',
-      'POST /send-due-reminders — Manual WhatsApp blast',
-      'GET  /wa-qr            — Scan WhatsApp QR',
-      'POST /sync             — Push library state from browser',
-      'GET  /state            — Get library state',
-      'GET  /motion-log       — Recent motion events'
-    ]
-  });
+app.get('/state',(req,res)=>res.json(loadDB()));
+app.get('/motion-log',(req,res)=>res.json(loadDB().motionLog||[]));
+app.get('/due-list',(req,res)=>{
+  const db=loadDB();
+  const due=Object.keys(db.seats).filter(k=>db.seats[k].status==='occupied'&&isDue(db.seats[k].student))
+    .map(k=>({seat:k,name:db.seats[k].student.name,phone:db.seats[k].student.phone,
+      fee:getFee(db.seats[k].student.gender,db),
+      hasWaKey:!!db.settings.callmebotKeys?.[db.seats[k].student.phone.replace(/\D/g,'')]}));
+  res.json({month:curMonth(),total:due.length,due});
 });
 
-// ── Start ─────────────────────────────────────────────────────────────────────
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-  initWhatsApp();
-});
+const PORT=process.env.PORT||3000;
+app.listen(PORT,()=>console.log(`Rudra Library Server on port ${PORT}`));
